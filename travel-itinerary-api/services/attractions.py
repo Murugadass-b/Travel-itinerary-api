@@ -1,12 +1,17 @@
 """
-Attractions retrieval via OpenTripMap.
+Attractions retrieval via Geoapify Places.
 
 We reuse the lat/long already resolved by services/weather.py (Open-Meteo
 geocoding) rather than geocoding the city a second time here -- one fewer
 API call, one fewer place for the two services to disagree about where
 "Goa" actually is.
 
-Requires OPENTRIPMAP_API_KEY to be set (see .env.example).
+Geoapify's free tier (3,000 requests/day) doesn't require a credit card --
+switched to this from OpenTripMap after OpenTripMap's signup started
+asking for billing details.
+
+Requires GEOAPIFY_API_KEY to be set (see .env.example).
+Get a free key at: https://myprojects.geoapify.com/
 """
 
 import os
@@ -14,57 +19,58 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-RADIUS_URL = "https://api.opentripmap.com/0.1/en/places/radius"
+PLACES_URL = "https://api.geoapify.com/v2/places"
 
-# Maps our free-text `interests` request field to OpenTripMap's controlled
-# "kinds" vocabulary. Anything the user types that isn't in this map is
+# Maps our free-text `interests` request field to Geoapify's controlled
+# category vocabulary. Anything the user types that isn't in this map is
 # just ignored -- see get_attractions() below.
-INTEREST_TO_KIND = {
-    "beaches": "beaches",
-    "beach": "beaches",
-    "history": "historic",
-    "historic": "historic",
-    "culture": "cultural",
-    "cultural": "cultural",
-    "museums": "museums",
+INTEREST_TO_CATEGORY = {
+    "beaches": "beach",
+    "beach": "beach",
+    "history": "heritage",
+    "historic": "heritage",
+    "culture": "entertainment.culture",
+    "cultural": "entertainment.culture",
+    "museums": "entertainment.museum",
     "nature": "natural",
-    "food": "foods",
-    "restaurants": "foods",
-    "nightlife": "amusements",
-    "shopping": "shops",
-    "architecture": "architecture",
+    "food": "catering.restaurant,catering.cafe",
+    "restaurants": "catering.restaurant",
+    "nightlife": "entertainment.nightclub,catering.bar",
+    "shopping": "commercial.shopping_mall",
+    "architecture": "heritage",
     "religion": "religion",
     "sport": "sport",
-    "adventure": "adventure",
+    "adventure": "leisure.park",
 }
 
-DEFAULT_KIND = "interesting_places"
+DEFAULT_CATEGORY = "tourism.attraction"
 
 
 class MissingApiKeyError(Exception):
-    """Raised when OPENTRIPMAP_API_KEY is not set in the environment."""
+    """Raised when GEOAPIFY_API_KEY is not set in the environment."""
 
 
 def _get_api_key() -> str:
-    api_key = os.getenv("OPENTRIPMAP_API_KEY")
+    api_key = os.getenv("GEOAPIFY_API_KEY")
     if not api_key:
         raise MissingApiKeyError(
-            "OPENTRIPMAP_API_KEY is not set. Add it to your .env file."
+            "GEOAPIFY_API_KEY is not set. Add it to your .env file."
         )
     return api_key
 
 
-def _resolve_kinds(interests: Optional[List[str]]) -> str:
-    """Turn a list of free-text interests into an OpenTripMap `kinds` string."""
+def _resolve_categories(interests: Optional[List[str]]) -> str:
+    """Turn a list of free-text interests into a Geoapify `categories` string."""
     if not interests:
-        return DEFAULT_KIND
+        return DEFAULT_CATEGORY
 
-    mapped = {
-        INTEREST_TO_KIND[interest.lower()]
-        for interest in interests
-        if interest.lower() in INTEREST_TO_KIND
-    }
-    return ",".join(mapped) if mapped else DEFAULT_KIND
+    mapped = set()
+    for interest in interests:
+        category = INTEREST_TO_CATEGORY.get(interest.lower())
+        if category:
+            mapped.update(category.split(","))
+
+    return ",".join(mapped) if mapped else DEFAULT_CATEGORY
 
 
 async def get_attractions(
@@ -77,39 +83,36 @@ async def get_attractions(
     """
     Fetch nearby points of interest, filtered by `interests` where possible.
 
-    Returns a simplified list of dicts: name, kinds, xid, distance_meters, point.
-    (xid can later be used to fetch full details from /places/xid/{xid} if
-    we want richer descriptions -- not needed for the itinerary prompt yet.)
+    Returns a simplified list of dicts: name, categories, place_id, address.
     """
     api_key = _get_api_key()
-    kinds = _resolve_kinds(interests)
+    categories = _resolve_categories(interests)
 
     params = {
-        "radius": radius_meters,
-        "lon": longitude,
-        "lat": latitude,
-        "kinds": kinds,
+        "categories": categories,
+        "filter": f"circle:{longitude},{latitude},{radius_meters}",
+        "bias": f"proximity:{longitude},{latitude}",
         "limit": limit,
-        "rate": 2,  # only include POIs with at least some editorial rating
-        "format": "json",
-        "apikey": api_key,
+        "lang": "en",
+        "apiKey": api_key,
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(RADIUS_URL, params=params)
+        response = await client.get(PLACES_URL, params=params)
         response.raise_for_status()
-        raw_results = response.json()
+        data = response.json()
+
+    features = data.get("features", [])
 
     attractions = [
         {
-            "name": poi.get("name"),
-            "kinds": poi.get("kinds"),
-            "xid": poi.get("xid"),
-            "distance_meters": poi.get("dist"),
-            "point": poi.get("point"),
+            "name": feature["properties"].get("name"),
+            "categories": feature["properties"].get("categories"),
+            "place_id": feature["properties"].get("place_id"),
+            "address": feature["properties"].get("formatted"),
         }
-        for poi in raw_results
-        if poi.get("name")  # skip unnamed POIs, not useful in an itinerary
+        for feature in features
+        if feature.get("properties", {}).get("name")  # skip unnamed POIs
     ]
 
     return attractions
